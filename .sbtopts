@@ -1,3 +1,0 @@
--J-Xms512M
--J-Xmx4096M
--J-XX:MaxGCPauseMillis=200

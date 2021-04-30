@@ -171,14 +171,17 @@ object JournalSequenceRetrievalConfig {
       maxTries = config.getInt("journal-sequence-retrieval.max-tries"),
       queryDelay = config.asFiniteDuration("journal-sequence-retrieval.query-delay"),
       maxBackoffQueryDelay = config.asFiniteDuration("journal-sequence-retrieval.max-backoff-query-delay"),
-      askTimeout = config.asFiniteDuration("journal-sequence-retrieval.ask-timeout"))
+      askTimeout = config.asFiniteDuration("journal-sequence-retrieval.ask-timeout"),
+      failFast = config.getBoolean("journal-sequence-retrieval.failFast")
+    )
 }
 case class JournalSequenceRetrievalConfig(
     batchSize: Int,
     maxTries: Int,
     queryDelay: FiniteDuration,
     maxBackoffQueryDelay: FiniteDuration,
-    askTimeout: FiniteDuration)
+    askTimeout: FiniteDuration,
+    failFast: Boolean)
 
 class ReadJournalConfig(config: Config) {
   val journalTableConfiguration = new LegacyJournalTableConfiguration(config)

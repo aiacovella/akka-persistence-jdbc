@@ -14,6 +14,7 @@ lazy val core = project
   .configs(IntegrationTest.extend(Test))
   .settings(Defaults.itSettings)
   .settings(
+    version := "PFG-5.0.0",
     name := "akka-persistence-jdbc",
     libraryDependencies ++= Dependencies.Libraries,
     mimaReportSignatureProblems := true,

@@ -7,7 +7,11 @@ package akka.persistence.jdbc.query
 package scaladsl
 
 import akka.NotUsed
+import akka.actor.Actor
 import akka.actor.ExtendedActorSystem
+import akka.actor.Kill
+import akka.actor.OneForOneStrategy
+import akka.actor.Props
 import akka.persistence.jdbc.config.ReadJournalConfig
 import akka.persistence.jdbc.query.JournalSequenceActor.{ GetMaxOrderingId, MaxOrderingId }
 import akka.persistence.jdbc.db.SlickExtension
@@ -30,6 +34,8 @@ import scala.util.{ Failure, Success }
 import akka.actor.Scheduler
 import akka.persistence.jdbc.query.dao.ReadJournalDao
 import akka.persistence.jdbc.util.PluginVersionChecker
+import akka.actor.SupervisorStrategy
+import akka.persistence.jdbc.query.JournalSequenceActor.TerminateStream
 
 object JdbcReadJournal {
   final val Identifier = "jdbc-read-journal"
@@ -79,10 +85,11 @@ class JdbcReadJournal(config: Config, configPath: String)(implicit val system: E
     }
   }
 
-  // Started lazily to prevent the actor for querying the db if no eventsByTag queries are used
   private[query] lazy val journalSequenceActor = system.systemActorOf(
-    JournalSequenceActor.props(readJournalDao, readJournalConfig.journalSequenceRetrievalConfiguration),
-    s"$configPath.akka-persistence-jdbc-journal-sequence-actor")
+    JournalActorSupervisor.props(readJournalDao, readJournalConfig, configPath),
+    s"$configPath.akka-persistence-jdbc-journal-sequence-actor",
+  )
+
   private val delaySource =
     Source.tick(readJournalConfig.refreshInterval, 0.seconds, 0).take(1)
 
@@ -221,9 +228,9 @@ class JdbcReadJournal(config: Config, configPath: String)(implicit val system: E
    *                             will be returned completely.
    */
   private def eventsByTag(
-      tag: String,
-      offset: Long,
-      terminateAfterOffset: Option[Long]): Source[EventEnvelope, NotUsed] = {
+    tag: String,
+    offset: Long,
+    terminateAfterOffset: Option[Long]): Source[EventEnvelope, NotUsed] = {
     import akka.pattern.ask
     import FlowControl._
     implicit val askTimeout: Timeout = Timeout(readJournalConfig.journalSequenceRetrievalConfiguration.askTimeout)
@@ -232,42 +239,54 @@ class JdbcReadJournal(config: Config, configPath: String)(implicit val system: E
     Source
       .unfoldAsync[(Long, FlowControl), Seq[EventEnvelope]]((offset, Continue)) { case (from, control) =>
         def retrieveNextBatch() = {
-          for {
-            queryUntil <- journalSequenceActor.ask(GetMaxOrderingId).mapTo[MaxOrderingId]
-            xs <- currentJournalEventsByTag(tag, from, batchSize, queryUntil).runWith(Sink.seq)
-          } yield {
-            val hasMoreEvents = xs.size == batchSize
-            val nextControl: FlowControl =
-              terminateAfterOffset match {
-                // we may stop if target is behind queryUntil and we don't have more events to fetch
-                case Some(target) if !hasMoreEvents && target <= queryUntil.maxOrdering => Stop
-                // We may also stop if we have found an event with an offset >= target
-                case Some(target) if xs.exists(_.offset.value >= target) => Stop
+            journalSequenceActor.ask(GetMaxOrderingId) flatMap {
+          case e @ MaxOrderingId(_) =>
+            for {
+              queryUntil <- Future.successful(e)
+              xs <- currentJournalEventsByTag(tag, from, batchSize, queryUntil).runWith(Sink.seq)
+                  } yield {
+                  val hasMoreEvents = xs.size == batchSize
+                  val nextControl: FlowControl =
+                    terminateAfterOffset match {
+                      // we may stop if target is behind queryUntil and we don't have more events to fetch
+                      case Some(target) if !hasMoreEvents && target <= queryUntil.maxOrdering =>
+                        Stop
+                      // We may also stop if we have found an event with an offset >= target
+                      case Some(target) if xs.exists(_.offset.value >= target) =>
+                        Stop
 
-                // otherwise, disregarding if Some or None, we must decide how to continue
-                case _ =>
-                  if (hasMoreEvents) Continue else ContinueDelayed
-              }
+                      // otherwise, disregarding if Some or None, we must decide how to continue
+                      case _ =>
+                        if(hasMoreEvents) Continue else ContinueDelayed
+                    }
 
-            val nextStartingOffset = if (xs.isEmpty) {
-              /* If no events matched the tag between `from` and `maxOrdering` then there is no need to execute the exact
-               * same query again. We can continue querying from `maxOrdering`, which will save some load on the db.
-               * (Note: we may never return a value smaller than `from`, otherwise we might return duplicate events) */
-              math.max(from, queryUntil.maxOrdering)
-            } else {
-              // Continue querying from the largest offset
-              xs.map(_.offset.value).max
+                  val nextStartingOffset = if(xs.isEmpty) {
+                    /* If no events matched the tag between `from` and `maxOrdering` then there is no need to execute the exact
+                     * same query again. We can continue querying from `maxOrdering`, which will save some load on the db.
+                     * (Note: we may never return a value smaller than `from`, otherwise we might return duplicate events) */
+                    math.max(from, queryUntil.maxOrdering)
+                  }
+                  else {
+                    // Continue querying from the largest offset
+                    xs.map(_.offset.value).max
+                  }
+                  Some(((nextStartingOffset, nextControl), xs))
+                }
+
+              case TerminateStream =>
+                journalSequenceActor ! RestartChild
+                Future.failed(new RuntimeException("failing fast on gaps"))
             }
-            Some(((nextStartingOffset, nextControl), xs))
           }
-        }
 
-        control match {
-          case Stop     => Future.successful(None)
-          case Continue => retrieveNextBatch()
-          case ContinueDelayed =>
-            akka.pattern.after(readJournalConfig.refreshInterval, system.scheduler)(retrieveNextBatch())
-        }
+          control match {
+            case Stop     => Future.successful(None)
+            case Continue => retrieveNextBatch()
+            case ContinueDelayed =>
+              akka.pattern.after(readJournalConfig.refreshInterval, system.scheduler)(
+                retrieveNextBatch(),
+              )
+          }
       }
       .mapConcat(identity)
   }
@@ -281,33 +300,79 @@ class JdbcReadJournal(config: Config, configPath: String)(implicit val system: E
   }
 
   /**
-   * Query events that have a specific tag.
-   *
+    * Query events that have a specific tag.
+    *
    * The consumer can keep track of its current position in the event stream by storing the
-   * `offset` and restart the query from a given `offset` after a crash/restart.
-   * The offset is exclusive, i.e. the event corresponding to the given `offset` parameter is not
-   * included in the stream.
-   *
+    * `offset` and restart the query from a given `offset` after a crash/restart.
+    * The offset is exclusive, i.e. the event corresponding to the given `offset` parameter is not
+    * included in the stream.
+    *
    * For akka-persistence-jdbc the `offset` corresponds to the `ordering` column in the Journal table.
-   * The `ordering` is a sequential id number that uniquely identifies the position of each event within
-   * the event stream. The `Offset` type is `akka.persistence.query.Sequence` with the `ordering` as the
-   * offset value.
-   *
+    * The `ordering` is a sequential id number that uniquely identifies the position of each event within
+    * the event stream. The `Offset` type is `akka.persistence.query.Sequence` with the `ordering` as the
+    * offset value.
+    *
    * The returned event stream is ordered by `offset`.
-   *
+    *
    * In addition to the `offset` the `EventEnvelope` also provides `persistenceId` and `sequenceNr`
-   * for each event. The `sequenceNr` is the sequence number for the persistent actor with the
-   * `persistenceId` that persisted the event. The `persistenceId` + `sequenceNr` is an unique
-   * identifier for the event.
-   *
+    * for each event. The `sequenceNr` is the sequence number for the persistent actor with the
+    * `persistenceId` that persisted the event. The `persistenceId` + `sequenceNr` is an unique
+    * identifier for the event.
+    *
    * The stream is not completed when it reaches the end of the currently stored events,
-   * but it continues to push new events when new events are persisted.
-   * Corresponding query that is completed when it reaches the end of the currently
-   * stored events is provided by [[CurrentEventsByTagQuery#currentEventsByTag]].
-   */
+    * but it continues to push new events when new events are persisted.
+    * Corresponding query that is completed when it reaches the end of the currently
+    * stored events is provided by [[CurrentEventsByTagQuery#currentEventsByTag]].
+    */
   override def eventsByTag(tag: String, offset: Offset): Source[EventEnvelope, NotUsed] =
     eventsByTag(tag, offset.value)
 
   def eventsByTag(tag: String, offset: Long): Source[EventEnvelope, NotUsed] =
     eventsByTag(tag, offset, terminateAfterOffset = None)
+}
+
+class JournalActorSupervisor(
+  readJournalDao: ReadJournalDao,
+  readJournalConfig: ReadJournalConfig,
+  configPath: String,
+)(implicit materializer: Materializer)
+    extends Actor {
+
+  implicit val ev = materializer.executionContext
+
+  implicit val askTimeout: Timeout = Timeout(
+    readJournalConfig.journalSequenceRetrievalConfiguration.askTimeout,
+  )
+
+  val journalSequenceActor = context.actorOf(
+    JournalSequenceActor
+      .props(readJournalDao, readJournalConfig.journalSequenceRetrievalConfiguration),
+    s"$configPath.akka-persistence-jdbc-journal-sequence-actor",
+  )
+
+  override val supervisorStrategy: SupervisorStrategy = OneForOneStrategy() {
+    case _: Throwable =>
+      SupervisorStrategy.Restart
+  }
+
+  override def receive: Receive = {
+    case RestartChild =>
+      journalSequenceActor ! Kill
+    case msg =>
+      journalSequenceActor forward msg
+  }
+
+}
+
+case object RestartChild
+
+object JournalActorSupervisor {
+
+  def props(
+    readJournalDao: ReadJournalDao,
+    readJournalConfig: ReadJournalConfig,
+    configPath: String,
+  )(implicit
+    materializer: Materializer,
+  ): Props = Props(new JournalActorSupervisor(readJournalDao, readJournalConfig, configPath))
 }

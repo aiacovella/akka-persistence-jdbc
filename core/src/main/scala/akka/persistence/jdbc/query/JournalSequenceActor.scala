@@ -12,6 +12,7 @@ import akka.persistence.jdbc.config.JournalSequenceRetrievalConfig
 import akka.persistence.jdbc.query.dao.ReadJournalDao
 import akka.stream.Materializer
 import akka.stream.scaladsl.Sink
+import org.slf4j.LoggerFactory
 
 import scala.collection.immutable.NumericRange
 import scala.concurrent.duration.FiniteDuration
@@ -28,6 +29,7 @@ object JournalSequenceActor {
 
   case object GetMaxOrderingId
   case class MaxOrderingId(maxOrdering: OrderingId)
+  case object TerminateStream
 
   private case object QueryOrderingIdsTimerKey
   private case object AssumeMaxOrderingIdTimerKey
@@ -63,7 +65,14 @@ class JournalSequenceActor(readJournalDao: ReadJournalDao, config: JournalSequen
     with Timers {
   import JournalSequenceActor._
   import context.dispatcher
-  import config.{ batchSize, maxBackoffQueryDelay, maxTries, queryDelay }
+  import config.{batchSize, maxBackoffQueryDelay, maxTries, queryDelay}
+
+  val logger = LoggerFactory.getLogger(this.getClass)
+
+  override def postRestart(reason: Throwable): Unit = {
+    super.postRestart(reason)
+    logger.info(s"Restarting journal actor ${self.path.toString}")
+  }
 
   override def receive: Receive = receive(0L, Map.empty, 0)
 
@@ -127,6 +136,16 @@ class JournalSequenceActor(readJournalDao: ReadJournalDao, config: JournalSequen
   }
 
   /**
+   * The stream needs to be torn down at this point so the next
+   * request to tet the max ordering will return a TerminateStream message
+   * to let the stream know it is to terminate.
+   */
+  def failing: Receive = {
+    case GetMaxOrderingId =>
+      sender() ! TerminateStream
+  }
+
+  /**
    * This method that implements the "find gaps" algo. It's the meat and main purpose of this actor.
    */
   def findGaps(
@@ -177,6 +196,24 @@ class JournalSequenceActor(readJournalDao: ReadJournalDao, config: JournalSequen
     } else {
       // either we detected gaps or we reached the end of stream (batch not full)
       // in this case we want to keep querying but not immediately
+      continueOrTerminate(newMissingByCounter, moduloCounter, nextMax, maxTries)
+
+    }
+  }
+
+  private def continueOrTerminate(
+    newMissingByCounter: Map[Int, MissingElements],
+    moduloCounter: Int,
+    nextMax: OrderingId,
+    maxTries: Int,
+  ) = {
+    val currentMissing = newMissingByCounter.values.filter(_.elements.nonEmpty)
+
+    if(currentMissing.nonEmpty && config.failFast) {
+      logger.debug(s"Failing fast with missing \n\tcurrent modulo ${moduloCounter} \n\tgivenUp \n\t ${currentMissing.mkString("\n\t,")}")
+      context.become(failing)
+    }
+    else {
       scheduleQuery(queryDelay)
       context.become(receive(nextMax, newMissingByCounter, (moduloCounter + 1) % maxTries))
     }

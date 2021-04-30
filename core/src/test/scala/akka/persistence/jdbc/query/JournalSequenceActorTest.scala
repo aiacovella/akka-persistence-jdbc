@@ -266,7 +266,9 @@ class MockDaoJournalSequenceActorTest extends SharedActorSystemTestSpec {
       maxTries = maxTries,
       queryDelay = queryDelay,
       maxBackoffQueryDelay = 4.seconds,
-      askTimeout = 100.millis)
+      askTimeout = 100.millis,
+      failFast = false
+    )
     val mockDao = new TestProbeReadJournalDao(testProbe)
     val actor = system.actorOf(JournalSequenceActor.props(mockDao, config))
     try f(testProbe, actor)
